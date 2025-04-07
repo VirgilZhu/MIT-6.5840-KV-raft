@@ -20,7 +20,6 @@ package raft
 import (
 	"6.5840/labgob"
 	"bytes"
-	"math"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -318,7 +317,6 @@ func (rf *Raft) CommitChecker() {
 			DPrintf("server %v 准备将命令 %v(索引为 %v ) 应用到状态机\n", rf.me, msg.Command, msg.CommandIndex)
 		}
 		rf.mu.Unlock()
-		time.Sleep(CommitCheckTimeInterval)
 	}
 }
 
@@ -546,7 +544,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommit > rf.commitIndex {
 		// 5.If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
+		if args.LeaderCommit > len(rf.log)-1 {
+			rf.commitIndex = len(rf.log) - 1
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
 	}
 	rf.mu.Unlock()
 }
