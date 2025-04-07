@@ -95,10 +95,13 @@ type Raft struct {
 	rd        *rand.Rand
 	role      int
 
-	muVote    sync.Mutex // 互斥锁保护投票数据
-	voteCount int
+	//为每轮选票临时创建一个成员和投票锁
+	//muVote sync.Mutex // 互斥锁保护投票数据
+	//voteCount int
 
-	condApply *sync.Cond
+	condApply *sync.Cond // 条件变量实现 leader 更新一个 log 的 commit 触发 followers 同步该 commit
+
+	heartTimer *time.Timer
 }
 
 func (rf *Raft) Print() {
@@ -310,6 +313,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// DPrintf("leader %v 准备持久化", rf.me)
 	rf.persist()
 
+	defer func() {
+		rf.ResetHeartTimer(1)
+	}()
+
 	return len(rf.log) - 1, rf.currentTerm, true
 }
 
@@ -377,10 +384,11 @@ func (rf *Raft) Elect() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.currentTerm += 1 // 自增term
-	rf.role = Candidate // 成为候选人
-	rf.votedFor = rf.me // 给自己投票
-	rf.voteCount = 1    // 自己有一票
+	rf.currentTerm += 1   // 自增term
+	rf.role = Candidate   // 成为候选人
+	rf.votedFor = rf.me   // 给自己投票
+	voteCount := 1        // 自己有一票
+	var muVote sync.Mutex // 临时的投票锁
 	//rf.timeStamp = time.Now() // 自己给自己投票也算一种消息
 
 	DPrintf("server %v 开始发起新一轮投票, 新一轮的term为: %v", rf.me, rf.currentTerm)
@@ -396,28 +404,28 @@ func (rf *Raft) Elect() {
 		if i == rf.me {
 			continue
 		}
-		go rf.collectVote(i, args)
+		go rf.collectVote(i, args, &muVote, &voteCount)
 	}
 }
 
-func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
+func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs, muVote *sync.Mutex, voteCount *int) {
 	voteAnswer := rf.GetVoteAnswer(serverTo, args)
 	if !voteAnswer {
 		return
 	}
-	rf.muVote.Lock()
-	if rf.voteCount > len(rf.peers)/2 {
-		rf.muVote.Unlock()
+	muVote.Lock()
+	if *voteCount > len(rf.peers)/2 {
+		muVote.Unlock()
 		return
 	}
 
-	rf.voteCount += 1
-	if rf.voteCount > len(rf.peers)/2 {
+	*voteCount += 1
+	if *voteCount > len(rf.peers)/2 {
 		rf.mu.Lock()
 		if rf.role == Follower {
 			// 有另外一个投票的协程收到了更新的term而更改了自身状态为Follower
 			rf.mu.Unlock()
-			rf.muVote.Unlock()
+			muVote.Unlock()
 			return
 		}
 		DPrintf("server %v 成为了新的 leader", rf.me)
@@ -432,7 +440,7 @@ func (rf *Raft) collectVote(serverTo int, args *RequestVoteArgs) {
 		go rf.SendHeartBeats()
 	}
 
-	rf.muVote.Unlock()
+	muVote.Unlock()
 }
 
 func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
@@ -596,6 +604,7 @@ func (rf *Raft) SendHeartBeats() {
 
 	for !rf.killed() {
 		rf.mu.Lock()
+		<-rf.heartTimer.C
 		// if the server is dead or is not the leader, just return
 		if rf.role != Leader {
 			rf.mu.Unlock()
@@ -630,8 +639,13 @@ func (rf *Raft) SendHeartBeats() {
 
 		rf.mu.Unlock()
 
-		time.Sleep(time.Duration(HeartBeatTimeOut) * time.Millisecond)
+		//time.Sleep(time.Duration(HeartBeatTimeOut) * time.Millisecond)
+		rf.ResetHeartTimer(HeartBeatTimeOut)
 	}
+}
+
+func (rf *Raft) ResetHeartTimer(timeStamp int) {
+	rf.heartTimer.Reset(time.Duration(timeStamp) * time.Millisecond)
 }
 
 func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
@@ -780,6 +794,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.condApply = sync.NewCond(&rf.mu)
 	rf.rd = rand.New(rand.NewSource(int64(rf.me)))
 	rf.timer = time.NewTimer(0)
+	rf.heartTimer = time.NewTimer(0)
 	rf.ResetTimer()
 
 	// initialize from state persisted before a crash
