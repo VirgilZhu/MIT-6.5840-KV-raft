@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"math"
 	//	"bytes"
 	"math/rand"
@@ -122,33 +124,40 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	// DPrintf("server %v 开始持久化, 最后一个持久化的log为: %v:%v", rf.me, len(rf.log)-1, rf.log[len(rf.log)-1].Cmd)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+	// Your code here (2C).
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	if data == nil || len(data) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var votedFor int
+	var currentTerm int
+	var log []Entry
+	if d.Decode(&votedFor) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(&log) != nil {
+		DPrintf("readPersist failed\n")
+	} else {
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -201,6 +210,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 防止孤立节点不断超时并发起选举，导致 currentTerm 太大，leader 要发起很多次选举让 term++ 才能超过孤立节点的 currentTerm
 		rf.currentTerm = args.Term
 		rf.role = Follower
+		rf.persist()
 	}
 
 	// at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
@@ -216,6 +226,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			rf.votedFor = args.CandidateId
 			rf.role = Follower
+			rf.persist()
 			rf.timeStamp = time.Now()
 
 			rf.mu.Unlock()
@@ -286,6 +297,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	newEntry := &Entry{Term: rf.currentTerm, Cmd: command}
 	rf.log = append(rf.log, *newEntry)
+	// DPrintf("leader %v 准备持久化", rf.me)
+	rf.persist()
 
 	return len(rf.log) - 1, rf.currentTerm, true
 }
@@ -429,6 +442,7 @@ func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 	return reply.VoteGranted
 }
@@ -473,6 +487,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term // 更新iterm
 		rf.votedFor = -1           // 易错点: 更新投票记录为未投票
 		rf.role = Follower
+		rf.persist()
 	}
 
 	if len(args.Entries) == 0 {
@@ -505,7 +520,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 4. Append any new entries not already in the log
 	// 补充append的业务
-	rf.log = append(rf.log, args.Entries...)
+	// rf.log = append(rf.log, args.Entries...)
+	// 一条一条检查 log，避免 RPC 先后顺序混乱导致的重复 append logs
+	for idx, log := range args.Entries {
+		ridx := args.PrevLogIndex + 1 + idx
+		if ridx < len(rf.log) && rf.log[ridx].Term != log.Term {
+			// 某位置发生了冲突, 覆盖这个位置开始的所有内容
+			rf.log = rf.log[:ridx]
+			rf.log = append(rf.log, args.Entries[idx:]...)
+			break
+		} else if ridx == len(rf.log) {
+			// 没有发生冲突但长度更长了, 直接拼接
+			rf.log = append(rf.log, args.Entries[idx:]...)
+			break
+		}
+	}
+	rf.persist()
 	if len(args.Entries) != 0 {
 		// DPrintf("server %v 成功进行append, log: %+v\n", rf.me, rf.log)
 		DPrintf("server %v 成功进行append\n", rf.me)
@@ -618,6 +648,7 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		rf.currentTerm = reply.Term
 		rf.role = Follower
 		rf.votedFor = -1
+		rf.persist()
 		rf.timeStamp = time.Now()
 		rf.mu.Unlock()
 		return
@@ -683,18 +714,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.log = make([]Entry, 0)
 	rf.log = append(rf.log, Entry{Term: 0})
+
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	rf.timeStamp = time.Now()
+	// rf.timeStamp = time.Now()
 	rf.role = Follower
 	rf.applyCh = applyCh
 
-	for i := 0; i < len(rf.nextIndex); i++ {
-		rf.nextIndex[i] = 1 // raft中的index是从1开始的
-	}
-
 	// initialize from state persisted before a crash
+	// 如果读取成功, 将覆盖log, votedFor和currentTerm
 	rf.readPersist(persister.ReadRaftState())
+
+	for i := 0; i < len(rf.nextIndex); i++ {
+		rf.nextIndex[i] = len(rf.log) // raft中的index是从1开始的
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
